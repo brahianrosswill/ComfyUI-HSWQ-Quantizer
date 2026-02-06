@@ -9,7 +9,6 @@ import folder_paths
 # ----------------------------------------------------------------------------
 # グローバルセッション管理
 # ----------------------------------------------------------------------------
-# セッションデータとロックを管理
 _SESSIONS = {}
 _SESSION_LOCKS = {}
 _GLOBAL_LOCK = threading.Lock()
@@ -21,17 +20,48 @@ def _get_lock(session_key):
         return _SESSION_LOCKS[session_key]
 
 def _atomic_torch_save(obj, path: str):
-    """書き込み中の破損を防ぐAtomic Save"""
+    """書き込み中の破損を防ぐAtomic Save (os.replace使用)"""
     tmp = path + ".tmp"
     try:
         torch.save(obj, tmp)
+        # WindowsでもAtomicに近い動作を期待して replace を使用
         if os.path.exists(path):
-            os.remove(path)
-        os.rename(tmp, path)
+            os.replace(tmp, path)
+        else:
+            os.rename(tmp, path)
     except Exception as e:
         print(f"[HSWQCollector] Save failed: {e}")
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+def _snapshot_session_for_save(session: dict) -> dict:
+    """保存用スナップショットを作成する（保存中に内容が変わらないように固定化）
+    
+    注意:
+    - dict の shallow copy だけだと、Tensor が参照共有のままになり、保存中に in-place 更新され得る
+    - lock 内で clone まで行い、save 自体は lock 外で行うのが安全
+    """
+    meta = dict(session.get("meta", {}))
+    layers_in = session.get("layers", {})
+    layers_out = {}
+    
+    for name, st in layers_in.items():
+        imp = st.get("input_imp_sum", None)
+        # Tensorはcloneして計算グラフから切り離し、メモリを別にする
+        if isinstance(imp, torch.Tensor):
+            imp = imp.detach().clone()
+            
+        layers_out[name] = {
+            "output_sum": float(st.get("output_sum", 0.0)),
+            "output_sq_sum": float(st.get("output_sq_sum", 0.0)),
+            "out_count": int(st.get("out_count", 0)),
+            "input_imp_sum": imp,
+            "in_count": int(st.get("in_count", 0)),
+        }
+    return {"meta": meta, "layers": layers_out}
 
 def _get_session(save_folder_name, file_prefix, session_id):
     """セッションの取得・初期化・ロード"""
@@ -55,9 +85,9 @@ def _get_session(save_folder_name, file_prefix, session_id):
                 print(f"[HSWQCollector] Loading session from {ckpt_path}")
                 data = torch.load(ckpt_path, map_location="cpu")
                 
-                # 互換性チェック (簡易)
-                if data.get("meta", {}).get("type") != "hswq_dual_monitor":
-                    print("[HSWQCollector] Warning: File type mismatch. Starting new session.")
+                # 互換性チェック
+                if data.get("meta", {}).get("type") != "hswq_dual_monitor_v2":
+                    print("[HSWQCollector] Warning: Legacy file type. Starting new session (V2 High Precision).")
                 else:
                     _SESSIONS[key] = data
                     return data, ckpt_path, lock
@@ -68,27 +98,17 @@ def _get_session(save_folder_name, file_prefix, session_id):
         print(f"[HSWQCollector] Starting new session: {session_id}")
         session_data = {
             "meta": {
-                "type": "hswq_dual_monitor",
+                "type": "hswq_dual_monitor_v2", # V2フラグ
                 "created_at": time.strftime("%Y%m%d_%H%M%S"),
                 "total_steps": 0,
             },
             "layers": {} 
-            # 構造: 
-            # "layers": {
-            #    "layer_name": {
-            #       "output_sum": float,      # for Sensitivity (Mean)
-            #       "output_sq_sum": float,   # for Sensitivity (Variance)
-            #       "out_count": int,
-            #       "input_imp_sum": Tensor,  # for Importance (Channel Mean)
-            #       "in_count": int
-            #    }
-            # }
         }
         _SESSIONS[key] = session_data
         return session_data, ckpt_path, lock
 
 # ----------------------------------------------------------------------------
-# 集計バックエンド (HSWQ DualMonitor)
+# 集計バックエンド (HSWQ DualMonitor V2 - High Precision)
 # ----------------------------------------------------------------------------
 class HSWQStatsCollectorBackend:
     def __init__(self, session, lock, device):
@@ -105,37 +125,33 @@ class HSWQStatsCollectorBackend:
             return
 
         # --- 1. Output Sensitivity Calculation (Variance) ---
-        # Variance = E[X^2] - (E[X])^2
-        # ここでは sum と sum_sq を集める
-        
-        # Detach and cast to float32 for stability
+        # HSWQ仕様: Output side is cast to FP32, then accumulated in Python float (Double)
         out_f32 = out.detach().float()
         
         # Batch mean (Global scalar for the batch)
-        # HSWQスクリプトの実装に合わせ、バッチ全体の平均・二乗平均をとる
+        # .item() returns a python float (standard C double precision)
         batch_mean = out_f32.mean().item()
         batch_sq_mean = (out_f32 ** 2).mean().item()
         
         # --- 2. Input Importance Calculation (Channel Mean Abs) ---
-        inp_detached = inp.detach().float()
+        inp_detached = inp.detach()
         
-        # 形状に応じたチャネル平均の計算
-        # Conv2d: (B, C, H, W) -> reduce (0, 2, 3)
-        # Linear/Transformer: (B, T, C) -> reduce (0, 1)
+        # 形状に応じたチャネル平均の計算 (HSWQ V1.5/ZIT仕様)
         if inp_detached.dim() == 4:
+            # Conv2d: (B, C, H, W) -> reduce (0, 2, 3)
             current_imp = inp_detached.abs().mean(dim=(0, 2, 3))
         elif inp_detached.dim() == 3:
+            # Transformer: (B, T, C) -> reduce (0, 1)
             current_imp = inp_detached.abs().mean(dim=(0, 1))
         elif inp_detached.dim() == 2:
+            # Linear: (B, C) -> reduce (0)
              current_imp = inp_detached.abs().mean(dim=0)
         else:
-            # Fallback for unexpected shapes
-            current_imp = inp_detached.abs().mean()
-            # Scalar to 1D tensor
-            current_imp = current_imp.view(1)
+            # Fallback: オリジナル実装に合わせて ones(1) を返す (予期せぬ形状の場合)
+            current_imp = torch.ones((1,), device=inp_detached.device, dtype=inp_detached.dtype)
 
-        # CPUへ移動して集計 (VRAM節約)
-        current_imp_cpu = current_imp.cpu()
+        # CPUへ移動し、float64 (Double) にキャストして集計 (精度確保)
+        current_imp_cpu = current_imp.to(device="cpu", dtype=torch.float64)
         
         # --- Update Session (Thread-Safe) ---
         with self.lock:
@@ -145,7 +161,7 @@ class HSWQStatsCollectorBackend:
                     "output_sum": 0.0,
                     "output_sq_sum": 0.0,
                     "out_count": 0,
-                    "input_imp_sum": torch.zeros_like(current_imp_cpu),
+                    "input_imp_sum": torch.zeros_like(current_imp_cpu, dtype=torch.float64),
                     "in_count": 0
                 }
             
@@ -155,9 +171,8 @@ class HSWQStatsCollectorBackend:
             l_stats["out_count"] += 1
             
             # Input importance accumulator
-            # 形状が合うか確認 (初回作成時と異なるサイズが来ない前提だがガードする)
             if l_stats["input_imp_sum"].shape == current_imp_cpu.shape:
-                l_stats["input_imp_sum"] += current_imp_cpu
+                l_stats["input_imp_sum"].add_(current_imp_cpu)
                 l_stats["in_count"] += 1
 
 # ----------------------------------------------------------------------------
@@ -172,7 +187,7 @@ class SDXLHSWQCalibrationNode:
                 "save_folder_name": ("STRING", {"default": "hswq_stats"}), 
                 "file_prefix": ("STRING", {"default": "sdxl_calib"}),
                 "session_id": ("STRING", {"default": "session_01"}),
-                "target_layer": (["all_linear_conv", "attn_ffn", "unet_blocks"],),
+                # target_layer 選択肢は廃止 (全対象が安全)
                 "save_every_steps": ("INT", {"default": 50, "min": 1, "max": 10000, "label": "Save Every N Steps"}),
                 "reset_session": ("BOOLEAN", {"default": False}),
             }
@@ -183,7 +198,7 @@ class SDXLHSWQCalibrationNode:
     FUNCTION = "collect"
     CATEGORY = "Quantization"
 
-    def collect(self, model, save_folder_name, file_prefix, session_id, target_layer, save_every_steps, reset_session):
+    def collect(self, model, save_folder_name, file_prefix, session_id, save_every_steps, reset_session):
         m = model.clone()
         device = comfy.model_management.get_torch_device()
         
@@ -200,37 +215,59 @@ class SDXLHSWQCalibrationNode:
                         os.remove(ckpt_path)
                     except: pass
 
+        diffusion_model = m.model.diffusion_model
+        
+        # ----------------------------------------------------------------
+        # 1. フックのクリーンアップ (多重登録防止)
+        # ----------------------------------------------------------------
+        # ComfyUIはモデルオブジェクトを共有するため、前の実行で残ったフックを消す必要がある
+        if hasattr(diffusion_model, "_hswq_calibration_hooks"):
+            stale_hooks = diffusion_model._hswq_calibration_hooks
+            if len(stale_hooks) > 0:
+                print(f"[HSWQCollector] Cleaning up {len(stale_hooks)} stale hooks from previous run.")
+                for h in stale_hooks:
+                    h.remove()
+            diffusion_model._hswq_calibration_hooks.clear()
+        else:
+            diffusion_model._hswq_calibration_hooks = []
+
+        # ----------------------------------------------------------------
+        # 2. フックの常駐登録 (wrapperでスイッチング)
+        # ----------------------------------------------------------------
+        # wrapper内で参照するためのコンテナ
+        collector_ref = {"collector": None}
+
+        def _shared_hook_factory(layer_name):
+            def _hook(module, i, o):
+                # collectorがセットされている時だけ実行 (オーバーヘッド最小化)
+                c = collector_ref.get("collector", None)
+                if c is None:
+                    return
+                c.hook_fn(module, i, o, layer_name)
+            return _hook
+
+        hooks_count = 0
+        for name, module in diffusion_model.named_modules():
+            # HSWQ対象: Linear と Conv2d のみ
+            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                h = module.register_forward_hook(_shared_hook_factory(name))
+                diffusion_model._hswq_calibration_hooks.append(h)
+                hooks_count += 1
+        
+        print(f"[HSWQCollector] Armed {hooks_count} hooks for session {session_id}")
+
+        # ----------------------------------------------------------------
+        # 3. 実行ラッパー
+        # ----------------------------------------------------------------
         def stats_wrapper(model_function, params):
+            # この wrapper は「フック登録/解除」を毎ステップ行わず、
+            # 事前に登録した共有フックが参照する collector を差し替えるだけ。
+            
             # バックエンド初期化
             collector = HSWQStatsCollectorBackend(session, lock, device)
             
-            def create_hook(name):
-                return lambda module, i, o: collector.hook_fn(module, i, o, name)
-
-            diffusion_model = m.model.diffusion_model
-            hooks_list = []
-            
-            # ターゲット層のフック登録
-            for name, module in diffusion_model.named_modules():
-                should_hook = False
-                # HSWQではConv2dとLinearの両方が対象
-                is_target_type = isinstance(module, (nn.Linear, nn.Conv2d))
-                
-                if not is_target_type:
-                    continue
-
-                if target_layer == "all_linear_conv":
-                    should_hook = True
-                elif target_layer == "attn_ffn":
-                    if "attn" in name or "ff" in name:
-                        should_hook = True
-                elif target_layer == "unet_blocks":
-                    if "output_blocks" in name or "input_blocks" in name or "middle_block" in name:
-                         should_hook = True
-
-                if should_hook:
-                    h = module.register_forward_hook(create_hook(name))
-                    hooks_list.append(h)
+            # フック有効化
+            collector_ref["collector"] = collector
 
             try:
                 input_x = params.get("input")
@@ -247,28 +284,18 @@ class SDXLHSWQCalibrationNode:
                     current_steps = session["meta"]["total_steps"]
                     if current_steps % save_every_steps == 0:
                         do_save = True
-                
+
                 if do_save:
-                    # ディスク書き込みは時間がかかる可能性があるため、ロック内で行うか、
-                    # あるいはデータのコピーを取ってから保存する。
-                    # ここでは安全のためロック内でコピーを作成し、ロック外で保存する
-                    save_data = None
+                    # lock 内で「clone済みスナップショット」を作成
                     with lock:
-                        # Deep copy is safest but slow. 
-                        # Tensorは参照共有で問題ない(加算時に新tensorになるため)が、辞書構造はコピーする
-                        save_data = {
-                            "meta": session["meta"].copy(),
-                            "layers": session["layers"].copy() 
-                        }
-                    
-                    # 保存実行
-                    if save_data:
-                        _atomic_torch_save(save_data, ckpt_path)
-                        # print(f"[HSWQCollector] Saved stats at step {current_steps}")
+                        save_data = _snapshot_session_for_save(session)
+                    # save 自体は lock 外 (Atomic)
+                    _atomic_torch_save(save_data, ckpt_path)
+                    print(f"[HSWQCollector] Saved stats at step {current_steps}")
 
             finally:
-                for h in hooks_list:
-                    h.remove()
+                # 次の forward (通常の生成など) に影響しないよう無効化
+                collector_ref["collector"] = None
             
             return out
 
@@ -280,5 +307,5 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SDXLHSWQCalibrationNode": "SDXL HSWQ Calibration (DualMonitor)"
+    "SDXLHSWQCalibrationNode": "SDXL HSWQ Calibration (DualMonitor V2)"
 }
